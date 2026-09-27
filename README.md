@@ -22,7 +22,8 @@ listen after greeting.
 
 Set `RECORD_CALLS=true` to start a dual-channel Twilio recording for every call.
 The service plays `RECORDING_NOTICE` before connecting the media stream. Recording
-laws vary; configure an appropriate notice and consent flow for your callers.
+laws vary; configure an appropriate notice and consent flow for your callers. Set
+`RECORDING_NOTICE=none` only when lawful consent or disclosure is handled elsewhere.
 
 ## Deploy
 

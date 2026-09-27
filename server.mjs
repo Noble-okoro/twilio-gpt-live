@@ -74,10 +74,12 @@ app.post("/incoming-call", async (request, reply) => {
           recordingChannels: "dual",
           recordingTrack: "both",
         });
-        response.say(
+        const recordingNotice =
           process.env.RECORDING_NOTICE ||
-            "This call may be recorded for quality and training. By continuing, you consent to the recording.",
-        );
+          "This call may be recorded for quality and training. By continuing, you consent to the recording.";
+        if (!["none", "off"].includes(recordingNotice.trim().toLowerCase())) {
+          response.say(recordingNotice);
+        }
       } catch (error) {
         request.log.error({ err: error }, "Could not start Twilio call recording");
       }
