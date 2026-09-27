@@ -7,7 +7,9 @@ import twilio from "twilio";
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const RECORD_CALLS = process.env.RECORD_CALLS?.toLowerCase() === "true";
 
 if (!OPENAI_API_KEY) {
   throw new Error("OPENAI_API_KEY is required");
@@ -16,6 +18,11 @@ if (!OPENAI_API_KEY) {
 const app = Fastify({ logger: true, trustProxy: true });
 await app.register(formbody);
 await app.register(websocket);
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
 
 function publicHttpUrl(request, path = "") {
   if (PUBLIC_BASE_URL) {
@@ -57,6 +64,26 @@ app.post("/incoming-call", async (request, reply) => {
   }
 
   const response = new twilio.twiml.VoiceResponse();
+
+  if (RECORD_CALLS) {
+    if (!twilioClient || !request.body?.CallSid) {
+      request.log.error("Recording is enabled but Twilio credentials or CallSid are missing");
+    } else {
+      try {
+        await twilioClient.calls(request.body.CallSid).recordings.create({
+          recordingChannels: "dual",
+          recordingTrack: "both",
+        });
+        response.say(
+          process.env.RECORDING_NOTICE ||
+            "This call may be recorded for quality and training. By continuing, you consent to the recording.",
+        );
+      } catch (error) {
+        request.log.error({ err: error }, "Could not start Twilio call recording");
+      }
+    }
+  }
+
   const connect = response.connect();
   connect.stream({ url: publicWebSocketUrl(request) });
 
@@ -117,6 +144,9 @@ app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
           type: "responses",
           responses: {
             model: process.env.BACKEND_MODEL || "gpt-6-luna",
+            reasoning: {
+              effort: process.env.BACKEND_REASONING_EFFORT || "medium",
+            },
             instructions:
               process.env.BACKEND_INSTRUCTIONS ||
               "Answer accurately and briefly. Never claim an external action succeeded unless it is confirmed.",
@@ -142,6 +172,15 @@ app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
       while (queuedAudio.length) {
         sendOpenAI({ type: "session.input_audio.append", audio: queuedAudio.shift() });
       }
+
+      sendOpenAI({
+        type: "session.instructions.append",
+        event_id: `greeting_${Date.now()}`,
+        delegation_id: null,
+        content:
+          process.env.OPENING_GREETING_INSTRUCTIONS ||
+          "Greet the person now in English. Introduce yourself as the assistant and ask how you can help. Then pause and listen.",
+      });
       return;
     }
 
