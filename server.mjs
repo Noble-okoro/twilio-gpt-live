@@ -9,7 +9,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const RECORD_CALLS = process.env.RECORD_CALLS?.toLowerCase() === "true";
+const RECORD_CALLS = process.env.RECORD_CALLS?.trim().toLowerCase() === "true";
 
 if (!OPENAI_API_KEY) {
   throw new Error("OPENAI_API_KEY is required");
@@ -47,12 +47,17 @@ function validTwilioRequest(request) {
   const signature = request.headers["x-twilio-signature"];
   if (!signature) return false;
 
-  return twilio.validateRequest(
-    TWILIO_AUTH_TOKEN,
-    signature,
-    publicHttpUrl(request, request.url),
-    request.body || {},
-  );
+  const url = publicHttpUrl(request, request.url);
+  const urls = [url];
+  if (request.headers.upgrade?.toLowerCase() === "websocket") {
+    // Accept equivalent signed handshake URL forms, including Twilio's
+    // documented trailing-slash normalization. Every form still needs a signature.
+    urls.push(url.replace(/^http/, "ws"));
+    urls.push(...urls.map(value => `${value.replace(/\/$/, "")}/`));
+  }
+  return urls.some(candidate => twilio.validateRequest(
+    TWILIO_AUTH_TOKEN, signature, candidate, request.body || {},
+  ));
 }
 
 app.get("/", async () => ({ status: "ok", service: "twilio-gpt-live-bridge" }));
@@ -66,23 +71,12 @@ app.post("/incoming-call", async (request, reply) => {
   const response = new twilio.twiml.VoiceResponse();
 
   if (RECORD_CALLS) {
-    if (!twilioClient || !request.body?.CallSid) {
-      request.log.error("Recording is enabled but Twilio credentials or CallSid are missing");
-    } else {
-      try {
-        await twilioClient.calls(request.body.CallSid).recordings.create({
-          recordingChannels: "dual",
-          recordingTrack: "both",
-        });
-        const recordingNotice =
-          process.env.RECORDING_NOTICE ||
-          "This call may be recorded for quality and training. By continuing, you consent to the recording.";
-        if (!["none", "off"].includes(recordingNotice.trim().toLowerCase())) {
-          response.say(recordingNotice);
-        }
-      } catch (error) {
-        request.log.error({ err: error }, "Could not start Twilio call recording");
-      }
+    // Return TwiML first so Twilio can answer. Recording starts at stream start.
+    const recordingNotice =
+      process.env.RECORDING_NOTICE ||
+      "This call may be recorded for quality and training. By continuing, you consent to the recording.";
+    if (!["none", "off"].includes(recordingNotice.trim().toLowerCase())) {
+      response.say(recordingNotice);
     }
   }
 
@@ -92,12 +86,84 @@ app.post("/incoming-call", async (request, reply) => {
   reply.type("text/xml").send(response.toString());
 });
 
-app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
+app.get("/media-stream", {
+  websocket: true,
+  preValidation: async (request, reply) => {
+    if ((RECORD_CALLS && !TWILIO_AUTH_TOKEN) || !validTwilioRequest(request)) {
+      return reply.code(403).send("Invalid Twilio signature");
+    }
+  },
+}, (twilioSocket, request) => {
   let streamSid = null;
   let openaiStarted = false;
   let closing = false;
+  let recordingRequested = false;
+
+  async function startRecording(start) {
+    if (!RECORD_CALLS || recordingRequested || closing) return;
+    recordingRequested = true;
+    const callSid = start?.callSid;
+    if (!twilioClient || !/^CA[0-9a-f]{32}$/i.test(callSid || "")) {
+      request.log.error("Recording is enabled but Twilio credentials or CallSid are missing");
+      return;
+    }
+    if (start.accountSid !== TWILIO_ACCOUNT_SID) {
+      request.log.error({ callSid, streamAccountSid: start.accountSid,
+        configuredAccountSid: TWILIO_ACCOUNT_SID }, "Recording account mismatch");
+      return;
+    }
+    try {
+      const recording = await twilioClient.calls(callSid).recordings.create({
+        recordingChannels: "dual",
+        recordingTrack: "both",
+      });
+      request.log.info({ callSid, recordingSid: recording.sid }, "Twilio call recording started");
+    } catch (error) {
+      // Do not blindly retry a recording creation: an ambiguous failure could
+      // otherwise create duplicate recordings. Preserve Twilio's diagnostic code.
+      request.log.error({ callSid, err: error }, "Could not start Twilio call recording");
+    }
+  }
   const queuedAudio = [];
   const maxQueuedChunks = 500;
+  let silenceTimer = null;
+  let nextInputAt = 0;
+  let greetingEventId = null;
+  let fillingSilence = false;
+  // G.711 mu-law encodes silence as 0xff: 160 samples = 20 ms at 8 kHz.
+  const silentFrame = Buffer.alloc(160, 0xff).toString("base64");
+
+  function appendInput(audio) {
+    sendOpenAI({ type: "session.input_audio.append", audio });
+    nextInputAt = Math.max(performance.now(), nextInputAt) +
+      Buffer.from(audio, "base64").length / 8;
+  }
+
+  function startConversation() {
+    if (!streamSid || !openaiStarted || closing || greetingEventId) return;
+    greetingEventId = `greeting_${Date.now()}`;
+    nextInputAt = performance.now();
+    sendOpenAI({
+      type: "session.instructions.append",
+      event_id: greetingEventId,
+      delegation_id: null,
+      content:
+        process.env.OPENING_GREETING_INSTRUCTIONS ||
+        "Greet the person now in English. Introduce yourself as the assistant and ask how you can help. Then pause and listen.",
+    });
+    request.log.info("Opening greeting requested");
+    while (queuedAudio.length) appendInput(queuedAudio.shift());
+    silenceTimer = setInterval(() => {
+      if (closing || openaiSocket.readyState !== WebSocket.OPEN ||
+          twilioSocket.readyState !== WebSocket.OPEN) return;
+      // Allow 100 ms for packet jitter. Never burst accumulated silence after a stall.
+      if (performance.now() < nextInputAt + (fillingSilence ? 0 : 100)) return;
+      if (!fillingSilence) request.log.info("Input audio gap: supplying silence");
+      fillingSilence = true;
+      appendInput(silentFrame);
+    }, 20);
+    silenceTimer.unref();
+  }
 
   const openaiSocket = new WebSocket("wss://api.openai.com/v1/live/sessions", {
     headers: {
@@ -120,6 +186,7 @@ app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
   function closeSession() {
     if (closing) return;
     closing = true;
+    clearInterval(silenceTimer);
 
     if (openaiStarted) {
       sendOpenAI({ type: "session.close" });
@@ -171,18 +238,13 @@ app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
       openaiStarted = true;
       request.log.info({ sessionId: event.session?.id }, "GPT-Live session started");
 
-      while (queuedAudio.length) {
-        sendOpenAI({ type: "session.input_audio.append", audio: queuedAudio.shift() });
-      }
+      startConversation();
+      return;
+    }
 
-      sendOpenAI({
-        type: "session.instructions.append",
-        event_id: `greeting_${Date.now()}`,
-        delegation_id: null,
-        content:
-          process.env.OPENING_GREETING_INSTRUCTIONS ||
-          "Greet the person now in English. Introduce yourself as the assistant and ask how you can help. Then pause and listen.",
-      });
+    if (event.type === "session.instructions.appended" &&
+        event.client_event_id === greetingEventId) {
+      request.log.info("Opening greeting instructions accepted");
       return;
     }
 
@@ -221,6 +283,8 @@ app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
   });
 
   openaiSocket.on("close", () => {
+    closing = true;
+    clearInterval(silenceTimer);
     if (twilioSocket.readyState === WebSocket.OPEN) twilioSocket.close();
   });
 
@@ -234,20 +298,25 @@ app.get("/media-stream", { websocket: true }, (twilioSocket, request) => {
     }
 
     if (message.event === "start") {
+      if (closing || streamSid) return;
       streamSid = message.start?.streamSid || message.streamSid;
       request.log.info(
         { streamSid, callSid: message.start?.callSid },
         "Twilio media stream started",
       );
+      void startRecording(message.start);
+      startConversation();
       return;
     }
 
     if (message.event === "media" && message.media?.payload) {
-      if (openaiStarted) {
-        sendOpenAI({
-          type: "session.input_audio.append",
-          audio: message.media.payload,
-        });
+      if (closing) return;
+      if (fillingSilence) {
+        request.log.info("Twilio input audio resumed");
+        fillingSilence = false;
+      }
+      if (openaiStarted && greetingEventId) {
+        appendInput(message.media.payload);
       } else {
         if (queuedAudio.length >= maxQueuedChunks) queuedAudio.shift();
         queuedAudio.push(message.media.payload);
